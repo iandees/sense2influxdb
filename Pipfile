@@ -6,7 +6,7 @@ name = "pypi"
 [packages]
 sense-energy = "*"
 influxdb = "*"
-websocket = "*"
+websocket-client = "*"
 
 [dev-packages]
 
