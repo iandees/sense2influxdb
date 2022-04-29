@@ -1,6 +1,6 @@
 import os
 import sys
-
+import time
 import sense_energy
 import json
 from sense_energy import Senseable
@@ -8,6 +8,7 @@ from sense_energy.sense_api import WS_URL, WSS_TIMEOUT
 from influxdb import InfluxDBClient
 from websocket import create_connection
 from websocket._exceptions import WebSocketTimeoutException
+from threading import Thread
 
 
 def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxDBClient) -> None:
@@ -24,10 +25,25 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                 item = result["payload"]
 
                 epoch = item['epoch']
-                voltage = item['voltage']
-                watts = item['channels']
-                freq = item['hz']
-                c = item['c']
+                voltage = item.get('voltage')
+                if voltage is None or len(voltage) != 2:
+                    print("Missing voltage:", json.dumps(result))
+                    continue
+
+                watts = item.get('channels')
+                if watts is None or len(watts) != 2:
+                    print("Missing watts:", json.dumps(result))
+                    continue
+
+                freq = item.get('hz')
+                if freq is None:
+                    print("Missing freq:", json.dumps(result))
+                    continue
+
+                c = item.get('c')
+                if c is None:
+                    print("Missing c:", json.dumps(result))
+                    continue
 
                 body = [
                     {
@@ -151,6 +167,90 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
             ws.close()
 
 
+def poll_devices(sense_client: sense_energy.Senseable, influx_client: InfluxDBClient) -> None:
+    devices = sense_client.get_discovered_device_data()
+
+    body = []
+    # Process "always on" first
+    data = sense_client.get_device_info('always_on')
+    usage = data['usage']
+    device = data['device']
+
+    usage_fields = ["avg_monthly_KWH", "avg_monthly_pct", "avg_watts", "yearly_KWH", "yearly_text", "yearly_cost", "avg_monthly_cost", "current_ao_wattage"]
+
+    point = {
+        "measurement": "sense_devices",
+        # "time": device['last_state_time'], There's no time on always_on
+        "tags": {
+            "device_id": device['id'],
+            "name": device['name'],
+        },
+        "fields": {
+            "icon": "always_on",
+        }
+    }
+
+    for field in usage_fields:
+        if field_value := usage.get(field):
+            if field == 'yearly_cost':
+                point['fields'][field] = field_value/100.0
+            else:
+                point['fields'][field] = field_value
+
+    body.append(point)
+
+    # Now the rest of the devices
+    for device in devices:
+        device_id = device.get('id')
+
+        if device_id in ('always_on', 'other', 'unknown'):
+            # Process these separately
+            continue
+
+        data = sense_client.get_device_info(device.get('id'))
+        usage = data['usage']
+        device = data['device']
+
+        point = {
+            "measurement": "sense_devices",
+            "time": device['last_state_time'],
+            "tags": {
+                "device_id": device['id'],
+                "name": device['name'],
+            },
+            "fields": {
+                'last_state': device['last_state'],
+            }
+        }
+
+        usage_fields = [
+            "current_month_runs",
+            "current_month_KWH",
+            "avg_monthly_runs",
+            "avg_monthly_KWH",
+            "avg_monthly_pct",
+            "avg_watts",
+            "avg_duration",
+            "yearly_KWH",
+            "yearly_text",
+            "yearly_cost",
+            "current_month_cost",
+            "avg_monthly_cost",
+            "current_ao_wattage",
+        ]
+
+        for field in usage_fields:
+            if field_value := usage.get(field):
+                if field == 'yearly_cost':
+                    point['fields'][field] = field_value/100.0
+                else:
+                    point['fields'][field] = field_value
+
+        body.append(point)
+
+    influx_client.write_points(body, time_precision='s')
+
+
 if __name__ == '__main__':
     sense = Senseable()
     sense_username = os.environ.get("SENSE_USERNAME")
@@ -160,6 +260,7 @@ if __name__ == '__main__':
     influx_user = os.environ.get("INFLUXDB_USERNAME")
     influx_pass = os.environ.get("INFLUXDB_PASSWORD")
     influx_db = os.environ.get("INFLUXDB_DB")
+    device_poll_time_sec = int(os.environ.get("DEVICE_POLL_TIME", "60"))
 
     if not (sense_username and sense_password):
         print("Set SENSE_USERNAME and SENSE_PASSWORD")
@@ -173,8 +274,35 @@ if __name__ == '__main__':
 
     ifclient = InfluxDBClient(influx_host, influx_port, influx_user, influx_pass, influx_db)
 
-    while True:
-        try:
-            start_listening(sense, ifclient)
-        except WebSocketTimeoutException:
-            print("Connection timeout. Trying again.")
+    def run_websocket(s, i):
+        while True:
+            try:
+                start_listening(s, i)
+            except WebSocketTimeoutException:
+                print("Connection timeout. Trying again.")
+
+    def run_device_poll(s, i):
+        while True:
+            start_time = time.time()
+
+            try:
+                poll_devices(sense, ifclient)
+            except Exception as e:
+                print("Polling failed: ", e)
+
+            end_time = time.time()
+            elapsed = (end_time - start_time)
+            sleep_time = device_poll_time_sec - elapsed
+
+            print(f"Sleeping {sleep_time:0.1f} secs")
+            time.sleep(sleep_time)
+
+
+    websocket_thread = Thread(target=run_websocket, args=(sense, ifclient))
+    poll_thread = Thread(target=run_device_poll, args=(sense, ifclient))
+
+    websocket_thread.start()
+    poll_thread.start()
+
+    websocket_thread.join()
+    poll_thread.join()
