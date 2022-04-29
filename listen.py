@@ -25,28 +25,17 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                 item = result["payload"]
 
                 epoch = item['epoch']
+
+                body = []
+
                 voltage = item.get('voltage')
+                watts = item.get('channels')
                 if voltage is None or len(voltage) != 2:
                     print("Missing voltage:", json.dumps(result))
-                    continue
-
-                watts = item.get('channels')
-                if watts is None or len(watts) != 2:
+                elif watts is None or len(watts) != 2:
                     print("Missing watts:", json.dumps(result))
-                    continue
-
-                freq = item.get('hz')
-                if freq is None:
-                    print("Missing freq:", json.dumps(result))
-                    continue
-
-                c = item.get('c')
-                if c is None:
-                    print("Missing c:", json.dumps(result))
-                    continue
-
-                body = [
-                    {
+                else:
+                    body.append({
                         "measurement": "sense_mains",
                         "time": epoch,
                         "tags": {"leg": "L1"},
@@ -54,8 +43,8 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                             "voltage": voltage[0],
                             "watts": watts[0],
                         },
-                    },
-                    {
+                    })
+                    body.append({
                         "measurement": "sense_mains",
                         "time": epoch,
                         "tags": {"leg": "L2"},
@@ -63,16 +52,23 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                             "voltage": voltage[1],
                             "watts": watts[1],
                         },
-                    },
-                    {
+                    })
+
+                freq = item.get('hz')
+                c = item.get('c')
+                if freq is None:
+                    print("Missing freq:", json.dumps(result))
+                elif c is None:
+                    print("Missing c:", json.dumps(result))
+                else:
+                    body.append({
                         "measurement": "sense_mains",
                         "time": epoch,
                         "fields": {
                             "c": c,
                             "hz": freq,
                         },
-                    },
-                ]
+                    })
 
                 for device in item.get('devices', []):
                     device_point = {
@@ -92,7 +88,6 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                 influx_client.write_points(body, time_precision='s')
             elif event_type == "new_timeline_event":
                 item = result["payload"]
-                print(json.dumps(item))
 
                 body = []
                 for added in item['items_added']:
@@ -159,7 +154,7 @@ def start_listening(sense_client: sense_energy.Senseable, influx_client: InfluxD
                 influx_client.write_points(body, time_precision='s')
 
             else:
-                print(json.dumps(result))
+                print(f"Unknown message type {result.get('type')}:", json.dumps(result))
     except WebSocketTimeoutException:
         raise
     finally:
@@ -294,7 +289,7 @@ if __name__ == '__main__':
             elapsed = (end_time - start_time)
             sleep_time = device_poll_time_sec - elapsed
 
-            print(f"Sleeping {sleep_time:0.1f} secs")
+            print(f"Done polling devices. Sleeping {sleep_time:0.1f} secs")
             time.sleep(sleep_time)
 
 
